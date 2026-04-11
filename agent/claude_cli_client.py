@@ -171,10 +171,21 @@ class _Messages:
         if model:
             cli_args.extend(["--model", model])
 
+        # Write system prompt to temp file to avoid arg length/escaping issues
+        import tempfile
+        system_file = None
         if system_text:
-            cli_args.extend(["--system-prompt", system_text])
+            system_file = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".txt", delete=False, dir="/tmp", prefix="hermes_sys_"
+            )
+            system_file.write(system_text)
+            system_file.close()
+            cli_args.extend(["--system-prompt-file", system_file.name])
 
-        logger.info("Claude CLI call: model=%s, prompt_len=%d", model, len(prompt))
+        logger.info(
+            "Claude CLI call: model=%s, prompt_len=%d, system_len=%d",
+            model, len(prompt), len(system_text) if system_text else 0,
+        )
 
         try:
             result = subprocess.run(
@@ -186,12 +197,30 @@ class _Messages:
                 env={**os.environ},
             )
         except subprocess.TimeoutExpired:
+            if system_file:
+                try:
+                    os.unlink(system_file.name)
+                except OSError:
+                    pass
             raise TimeoutError("Claude CLI timed out after 900 seconds")
+
+        if system_file:
+            try:
+                os.unlink(system_file.name)
+            except OSError:
+                pass
 
         if result.returncode != 0:
             stderr = result.stderr.strip()
-            logger.error("Claude CLI failed (exit %d): %s", result.returncode, stderr[:500])
-            raise RuntimeError(f"Claude CLI failed (exit {result.returncode}): {stderr[:500]}")
+            stdout_preview = result.stdout.strip()[:300]
+            logger.error(
+                "Claude CLI failed (exit %d): stderr=%s stdout=%s",
+                result.returncode, stderr[:300], stdout_preview,
+            )
+            raise RuntimeError(
+                f"Claude CLI failed (exit {result.returncode}): "
+                f"{stderr[:300] or stdout_preview[:300] or '(no output)'}"
+            )
 
         stdout = result.stdout.strip()
         if not stdout:
