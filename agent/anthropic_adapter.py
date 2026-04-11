@@ -96,7 +96,6 @@ def _supports_adaptive_thinking(model: str) -> bool:
 # Beta headers for enhanced features (sent with ALL auth types)
 _COMMON_BETAS = [
     "interleaved-thinking-2025-05-14",
-    "fine-grained-tool-streaming-2025-05-14",
 ]
 # MiniMax's Anthropic-compatible endpoints fail tool-use requests when
 # the fine-grained tool streaming beta is present.  Omit it so tool calls
@@ -109,10 +108,16 @@ _TOOL_STREAMING_BETA = "fine-grained-tool-streaming-2025-05-14"
 _FAST_MODE_BETA = "fast-mode-2026-02-01"
 
 # Additional beta headers required for OAuth/subscription auth.
-# Matches what Claude Code (and pi-ai / OpenCode) send.
+# Must match exactly what Claude Code CLI sends.
 _OAUTH_ONLY_BETAS = [
     "claude-code-20250219",
     "oauth-2025-04-20",
+    "context-1m-2025-08-07",
+    "context-management-2025-06-27",
+    "prompt-caching-scope-2026-01-05",
+    "advisor-tool-2026-03-01",
+    "advanced-tool-use-2025-11-20",
+    "effort-2025-11-24",
 ]
 
 # Claude Code identity — required for OAuth requests to be routed correctly.
