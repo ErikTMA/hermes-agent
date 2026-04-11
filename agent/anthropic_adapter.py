@@ -838,9 +838,18 @@ def build_anthropic_client(
         if common_betas:
             kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
     elif _is_oauth_token(api_key):
-        # OAuth access token / setup-token → Bearer auth + Claude Code identity.
-        # Anthropic routes OAuth requests based on user-agent and headers;
-        # without Claude Code's fingerprint, requests get intermittent 500s.
+        # OAuth access token / setup-token. Prefer routing through the Claude
+        # Code CLI, which Anthropic whitelists for subscription auth. When the
+        # CLI is unavailable, fall back to the direct Bearer path with Claude
+        # Code identity headers — Anthropic routes OAuth requests on user-agent
+        # and headers, and without that fingerprint requests get intermittent
+        # 500s.
+        try:
+            from agent.claude_cli_client import build_claude_cli_client
+            logger.info("OAuth token detected — routing through Claude Code CLI")
+            return build_claude_cli_client()
+        except (ImportError, FileNotFoundError) as e:
+            logger.warning("Claude CLI not available (%s), using direct OAuth path", e)
         all_betas = common_betas + _OAUTH_ONLY_BETAS
         kwargs["auth_token"] = api_key
         kwargs["default_headers"] = {
