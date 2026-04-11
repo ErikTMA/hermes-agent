@@ -81,70 +81,50 @@ def _parse_content_block(block: dict):
             input=block.get("input", {}),
         )
     else:
-        # Return as-is for unknown types
         return block
 
 
-def _format_messages_for_cli(messages: list, system=None) -> str:
-    """Convert anthropic messages format to CLI stream-json input.
-
-    The CLI expects one JSON message per line on stdin.
-    For a single-turn call, we send the full conversation as one user message.
-    """
-    # Build the conversation content
-    # The CLI's stream-json input expects {"type": "user", "message": {...}}
-    # For multi-turn, we'd need to send each message separately, but for
-    # a single API call, we send the last user message and let the CLI
-    # handle it with the full context.
-
-    # Find the last user message
-    last_user = None
+def _extract_prompt_text(messages: list) -> str:
+    """Extract the last user message as a prompt string for the CLI."""
     for msg in reversed(messages):
         if isinstance(msg, dict) and msg.get("role") == "user":
-            last_user = msg
-            break
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                return content
+            elif isinstance(content, list):
+                parts = []
+                for block in content:
+                    if isinstance(block, dict):
+                        if block.get("type") == "text":
+                            parts.append(block.get("text", ""))
+                        elif block.get("type") == "tool_result":
+                            # Include tool results as context
+                            result_content = block.get("content", "")
+                            if isinstance(result_content, list):
+                                for rb in result_content:
+                                    if isinstance(rb, dict) and rb.get("type") == "text":
+                                        parts.append(rb.get("text", ""))
+                            elif isinstance(result_content, str):
+                                parts.append(result_content)
+                    elif isinstance(block, str):
+                        parts.append(block)
+                return "\n".join(parts)
+    return ""
 
-    if not last_user:
-        # Fallback: send all messages as context
-        last_user = messages[-1] if messages else {"role": "user", "content": ""}
 
-    cli_msg = {
-        "type": "user",
-        "message": last_user,
-    }
-    return json.dumps(cli_msg)
-
-
-def _build_cli_args(
-    model: str,
-    system_prompt: Optional[str] = None,
-    max_tokens: Optional[int] = None,
-    tools: Optional[list] = None,
-) -> list:
-    """Build CLI command arguments."""
-    claude_path = shutil.which("claude")
-    if not claude_path:
-        raise FileNotFoundError(
-            "Claude Code CLI not found. Install with: npm install -g @anthropic-ai/claude-code"
-        )
-
-    args = [
-        claude_path,
-        "--print",
-        "--output-format", "json",
-        "--max-turns", "1",
-    ]
-
-    if model:
-        args.extend(["--model", model])
-
-    if system_prompt:
-        args.extend(["--system-prompt", system_prompt])
-
-    # Disable all built-in tools — hermes handles tools itself
-    args.extend(["--allowedTools", ""])
-
-    return args
+def _build_system_text(system) -> str:
+    """Convert system prompt to a string."""
+    if isinstance(system, str):
+        return system
+    elif isinstance(system, list):
+        parts = []
+        for block in system:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "\n\n".join(parts)
+    return ""
 
 
 class _Messages:
@@ -166,122 +146,53 @@ class _Messages:
         extra_body: Optional[dict] = None,
         **kwargs,
     ) -> Message:
-        """Execute a messages.create() call through the Claude CLI.
+        """Execute a messages.create() call through the Claude CLI."""
 
-        Spawns the CLI as a subprocess, passes the prompt, and returns
-        the response in anthropic SDK Message format.
+        prompt = _extract_prompt_text(messages)
+        if not prompt:
+            prompt = "Continue."
 
-        Note: streaming is not yet supported — responses are returned
-        in full after the CLI completes.
-        """
-        # Build system prompt string
-        system_text = ""
-        if isinstance(system, str):
-            system_text = system
-        elif isinstance(system, list):
-            # Extract text blocks
-            parts = []
-            for block in system:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    parts.append(block.get("text", ""))
-                elif isinstance(block, str):
-                    parts.append(block)
-            system_text = "\n\n".join(parts)
-
-        # Build the prompt from messages
-        # For the CLI, we need to construct a single prompt that includes
-        # the conversation context
-        prompt_parts = []
-        for msg in messages:
-            if isinstance(msg, dict):
-                role = msg.get("role", "")
-                content = msg.get("content", "")
-                if isinstance(content, list):
-                    # Extract text from content blocks
-                    text_parts = []
-                    for block in content:
-                        if isinstance(block, dict):
-                            if block.get("type") == "text":
-                                text_parts.append(block.get("text", ""))
-                            elif block.get("type") == "tool_result":
-                                text_parts.append(f"[Tool Result: {json.dumps(block.get('content', ''))}]")
-                            elif block.get("type") == "tool_use":
-                                text_parts.append(f"[Tool Call: {block.get('name', '')}({json.dumps(block.get('input', {}))})]")
-                    content = "\n".join(text_parts)
-
-                if role == "user":
-                    prompt_parts.append(f"User: {content}")
-                elif role == "assistant":
-                    prompt_parts.append(f"Assistant: {content}")
-
-        prompt = "\n\n".join(prompt_parts)
-
-        # If there are tools, include them in the system prompt
-        if tools:
-            tool_descriptions = []
-            for t in tools:
-                name = t.get("name", "")
-                desc = t.get("description", "")
-                params = json.dumps(t.get("input_schema", {}))
-                tool_descriptions.append(f"- {name}: {desc}\n  Parameters: {params}")
-
-            tools_text = "Available tools:\n" + "\n".join(tool_descriptions)
-            tools_text += "\n\nTo use a tool, respond with a tool_use content block."
-            if system_text:
-                system_text = system_text + "\n\n" + tools_text
-            else:
-                system_text = tools_text
+        system_text = _build_system_text(system)
 
         # Build CLI command
-        cli_args = _build_cli_args(
-            model=model,
-            system_prompt=system_text if system_text else None,
-            max_tokens=max_tokens,
-            tools=tools,
-        )
-
-        # Get just the last user message as the prompt
-        last_user_content = ""
-        for msg in reversed(messages):
-            if isinstance(msg, dict) and msg.get("role") == "user":
-                content = msg.get("content", "")
-                if isinstance(content, str):
-                    last_user_content = content
-                elif isinstance(content, list):
-                    parts = []
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            parts.append(block.get("text", ""))
-                    last_user_content = "\n".join(parts)
-                break
-
-        if not last_user_content:
-            last_user_content = prompt
-
-        logger.debug("Claude CLI call: model=%s, prompt_len=%d", model, len(last_user_content))
-
-        try:
-            result = subprocess.run(
-                cli_args + [last_user_content],
-                capture_output=True,
-                text=True,
-                timeout=900,
-                env={**os.environ, "CLAUDE_CODE_SIMPLE": "1"},
-            )
-        except subprocess.TimeoutExpired:
-            raise TimeoutError("Claude CLI timed out after 900 seconds")
-        except FileNotFoundError:
+        claude_path = shutil.which("claude")
+        if not claude_path:
             raise FileNotFoundError(
                 "Claude Code CLI not found. Install with: npm install -g @anthropic-ai/claude-code"
             )
 
+        cli_args = [
+            claude_path,
+            "--print",
+            "--output-format", "json",
+            "--max-turns", "1",
+        ]
+
+        if model:
+            cli_args.extend(["--model", model])
+
+        if system_text:
+            cli_args.extend(["--system-prompt", system_text])
+
+        logger.info("Claude CLI call: model=%s, prompt_len=%d", model, len(prompt))
+
+        try:
+            result = subprocess.run(
+                cli_args,
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=900,
+                env={**os.environ},
+            )
+        except subprocess.TimeoutExpired:
+            raise TimeoutError("Claude CLI timed out after 900 seconds")
+
         if result.returncode != 0:
             stderr = result.stderr.strip()
             logger.error("Claude CLI failed (exit %d): %s", result.returncode, stderr[:500])
-            # Try to parse error from stderr
             raise RuntimeError(f"Claude CLI failed (exit {result.returncode}): {stderr[:500]}")
 
-        # Parse the JSON output
         stdout = result.stdout.strip()
         if not stdout:
             raise RuntimeError("Claude CLI returned empty response")
@@ -289,21 +200,18 @@ class _Messages:
         try:
             data = json.loads(stdout)
         except json.JSONDecodeError:
-            # The output might be plain text (non-JSON mode fallback)
+            # Plain text output
             return Message(
                 id=f"cli-{int(time.time())}",
                 model=model,
                 content=[TextBlock(text=stdout)],
                 stop_reason="end_turn",
-                usage=Usage(input_tokens=0, output_tokens=len(stdout.split())),
+                usage=Usage(output_tokens=len(stdout.split())),
             )
 
-        # Parse the JSON response
-        # The --output-format json returns a result object
+        # Parse JSON response from --output-format json
         if isinstance(data, dict):
             result_text = data.get("result", "")
-            cost = data.get("total_cost_usd", 0)
-            num_turns = data.get("num_turns", 1)
             usage_data = data.get("usage", {})
 
             return Message(
@@ -319,7 +227,6 @@ class _Messages:
                 ),
             )
 
-        # Fallback
         return Message(
             id=f"cli-{int(time.time())}",
             model=model,
@@ -340,7 +247,11 @@ class ClaudeCliClient:
 
 def build_claude_cli_client() -> ClaudeCliClient:
     """Create a Claude CLI-backed client."""
-    # Verify claude is available
+    # Ensure local npm bin is in PATH
+    local_bin = os.path.expanduser("~/node_modules/.bin")
+    if local_bin not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = local_bin + ":" + os.environ.get("PATH", "")
+
     if not shutil.which("claude"):
         raise FileNotFoundError(
             "Claude Code CLI not found in PATH. "
