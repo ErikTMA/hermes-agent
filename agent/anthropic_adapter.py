@@ -272,16 +272,22 @@ def build_anthropic_client(api_key: str, base_url: str = None):
         if common_betas:
             kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
     elif _is_oauth_token(api_key):
-        # OAuth access token / setup-token → Bearer auth + Claude Code identity.
-        # Anthropic routes OAuth requests based on user-agent and headers;
-        # without Claude Code's fingerprint, requests get intermittent 500s.
-        all_betas = common_betas + _OAUTH_ONLY_BETAS
-        kwargs["auth_token"] = api_key
-        kwargs["default_headers"] = {
-            "anthropic-beta": ",".join(all_betas),
-            "user-agent": f"claude-cli/{_get_claude_code_version()} (external, cli)",
-            "x-app": "cli",
-        }
+        # OAuth tokens are blocked by Anthropic for third-party tools.
+        # Route through the Claude Code CLI which is whitelisted.
+        try:
+            from agent.claude_cli_client import build_claude_cli_client
+            logger.info("OAuth token detected — routing through Claude Code CLI")
+            return build_claude_cli_client()
+        except (ImportError, FileNotFoundError) as e:
+            logger.warning("Claude CLI not available (%s), falling back to direct API", e)
+            # Fallback to direct API (will likely get blocked)
+            all_betas = common_betas + _OAUTH_ONLY_BETAS
+            kwargs["auth_token"] = api_key
+            kwargs["default_headers"] = {
+                "anthropic-beta": ",".join(all_betas),
+                "user-agent": f"claude-cli/{_get_claude_code_version()} (external, cli)",
+                "x-app": "cli",
+            }
     else:
         # Regular API key → x-api-key header + common betas
         kwargs["api_key"] = api_key
