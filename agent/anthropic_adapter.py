@@ -112,7 +112,6 @@ _FAST_MODE_BETA = "fast-mode-2026-02-01"
 _OAUTH_ONLY_BETAS = [
     "claude-code-20250219",
     "oauth-2025-04-20",
-    "context-1m-2025-08-07",
     "context-management-2025-06-27",
     "prompt-caching-scope-2026-01-05",
     "advisor-tool-2026-03-01",
