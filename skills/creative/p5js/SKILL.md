@@ -1,6 +1,6 @@
 ---
 name: p5js
-description: "Production pipeline for interactive and generative visual art using p5.js. Creates browser-based sketches, generative art, data visualizations, interactive experiences, 3D scenes, audio-reactive visuals, and motion graphics — exported as HTML, PNG, GIF, MP4, or SVG. Covers: 2D/3D rendering, noise and particle systems, flow fields, shaders (GLSL), pixel manipulation, kinetic typography, WebGL scenes, audio analysis, mouse/keyboard interaction, and headless high-res export. Use when users request: p5.js sketches, creative coding, generative art, interactive visualizations, canvas animations, browser-based visual art, data viz, shader effects, or any p5.js project."
+description: "Production pipeline for interactive and generative visual art using p5.js. Creates browser-based sketches, generative art, data visualizations, interactive experiences, 3D scenes, and audio-reactive visuals — exported as HTML, PNG, GIF, MP4, or SVG. Use for p5.js sketches, creative coding, canvas animations, shader effects, or any p5.js project."
 version: 1.0.0
 metadata:
   hermes:
@@ -9,6 +9,12 @@ metadata:
 ---
 
 # p5.js Production Pipeline
+
+## When to use
+
+Triggers: p5.js sketches, creative coding, generative art, interactive visualizations, canvas animations, browser-based visual art, data viz, shader effects, or any p5.js project.
+
+Covers: 2D/3D rendering, noise and particle systems, flow fields, shaders (GLSL), pixel manipulation, kinetic typography, WebGL scenes, audio analysis, mouse/keyboard interaction, and headless high-res export. Output formats: HTML, PNG, GIF, MP4, SVG.
 
 ## Creative Standard
 
