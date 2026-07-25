@@ -628,6 +628,17 @@ class _Messages:
             run.granted,
         )
 
+        # Hermes' memory tool never fires on this path, so persist durable facts
+        # here instead. Backgrounded — the reply has already gone out.
+        try:
+            from agent.memory_writer import record_async
+            reply_text = "\n".join(
+                b.text for b in run.final_message.content if isinstance(b, TextBlock)
+            )
+            record_async(_last_user_text(messages), reply_text)
+        except Exception as exc:  # pragma: no cover - never break a turn for this
+            logger.debug("memory writer unavailable (%s)", exc)
+
     def stream(self, *, model: str, messages: list, system: Any = None, **kwargs) -> _StreamManager:
         run = self._prepare(model=model, messages=messages, system=system)
         return _StreamManager(run, self._remember)
