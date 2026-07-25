@@ -47,9 +47,11 @@ narrow allowlist of its own tools (see ``_DEFAULT_ALLOWED_TOOLS``) so the agent
 can at least read and write in its working directory and record memories.
 Override with ``HERMES_CLAUDE_CLI_ALLOWED_TOOLS``.
 
-Infisical is offered as an MCP server rather than by widening ``Bash``, so
-secret access is a named capability. Credentials come from ``INFISICAL_*`` in
-the environment and are never written to the workspace.
+MCP servers are read from Hermes' own ``config.yaml`` (``mcp_servers:``), so
+adding one is a config change rather than a code change, and each configured
+server is allowlisted as ``mcp__<name>``. Offering a capability as an MCP tool
+is preferred over widening ``Bash``: it stays a named capability instead of
+arbitrary shell.
 """
 
 from __future__ import annotations
@@ -86,39 +88,78 @@ _SESSION_TTL_SECONDS = int(os.getenv("HERMES_CLAUDE_CLI_SESSION_TTL", str(30 * 2
 # plus the one shell command it needs to persist memory. It is NOT general
 # shell access — this pod holds cluster RBAC, an SSH key to the kali workspace,
 # and Infisical credentials. Widen it consciously, not by accident.
-_DEFAULT_ALLOWED_TOOLS = "Read,Write,Edit,Glob,Grep,Bash(hermes memory:*),mcp__infisical"
-_ALLOWED_TOOLS = os.getenv("HERMES_CLAUDE_CLI_ALLOWED_TOOLS", _DEFAULT_ALLOWED_TOOLS)
+# Tools the CLI may run on its own, before MCP servers are added.
+#
+# Hermes' agent loop cannot drive tools through this path: the CLI returns a
+# finished turn, never raw tool_use blocks for Hermes to execute. With no tools
+# at all the agent can only talk — it cannot take a note, maintain its own
+# CLAUDE.md, or record a memory, and it tends to misreport that as a sandbox
+# permission error.
+#
+# Deliberately narrow: read/write within its working directory, plus the one
+# shell command it needs to persist memory. NOT general shell access — this pod
+# carries cluster RBAC, an SSH key to the kali workspace, and Infisical
+# credentials. Widen consciously, not by accident.
+_BASE_ALLOWED_TOOLS = "Read,Write,Edit,Glob,Grep,Bash(hermes memory:*)"
 
-# MCP servers offered to the CLI. Infisical is exposed as a tool rather than by
-# widening Bash, so secret access stays a named capability instead of arbitrary
-# shell. The server authenticates from INFISICAL_* in the environment; no
-# credential is written to disk.
-_MCP_SERVERS = {
-    "infisical": {
-        "command": "mcp",
-        "args": [],
-        "env": {
-            k: os.environ[k]
-            for k in (
-                "INFISICAL_HOST_URL",
-                "INFISICAL_UNIVERSAL_AUTH_CLIENT_ID",
-                "INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET",
-            )
-            if k in os.environ
-        },
-    }
-}
+# The CLI inherits the gateway's cwd otherwise, which is not the agent's
+# working directory and is not on persistent storage.
+_WORKDIR = os.getenv("HERMES_CLAUDE_CLI_CWD", "/home/hermes/workspace")
 
 
-def _mcp_config_path() -> Optional[str]:
+def _load_mcp_servers() -> Dict[str, dict]:
+    """Read MCP servers from Hermes' own config.yaml.
+
+    Adding an MCP server is a config change, not a code change: whatever is
+    declared under ``mcp_servers:`` is offered to the CLI, so a new server can
+    be rolled out by editing the ConfigMap and restarting.
+
+    Servers whose command is not on PATH are skipped rather than failing the
+    turn — a misconfigured server should not take the agent offline.
+    """
+    override = os.getenv("HERMES_CLAUDE_CLI_MCP_CONFIG")
+    if override:
+        return {}
+
+    config_path = os.path.join(_hermes_home(), "config.yaml")
+    try:
+        import yaml
+        with open(config_path, encoding="utf-8") as fh:
+            cfg = yaml.safe_load(fh) or {}
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        logger.warning("Could not read %s for MCP servers (%s)", config_path, exc)
+        return {}
+
+    declared = cfg.get("mcp_servers")
+    if not isinstance(declared, dict):
+        return {}
+
+    servers: Dict[str, dict] = {}
+    for name, spec in declared.items():
+        if not isinstance(spec, dict):
+            continue
+        command = spec.get("command")
+        if not command:
+            continue
+        resolved = shutil.which(command)
+        if not resolved:
+            logger.warning("MCP server %r skipped: %r not on PATH", name, command)
+            continue
+        entry = {"command": resolved, "args": list(spec.get("args") or [])}
+        env = spec.get("env")
+        if isinstance(env, dict) and env:
+            entry["env"] = {str(k): str(v) for k, v in env.items()}
+        servers[name] = entry
+    return servers
+
+
+def _mcp_config_path(servers: Dict[str, dict]) -> Optional[str]:
     """Materialise an MCP config for this process, or None if unusable."""
     override = os.getenv("HERMES_CLAUDE_CLI_MCP_CONFIG")
     if override:
         return override if os.path.exists(override) else None
-    servers = {
-        name: spec for name, spec in _MCP_SERVERS.items()
-        if spec.get("env") and shutil.which(spec["command"])
-    }
     if not servers:
         return None
     try:
@@ -132,7 +173,21 @@ def _mcp_config_path() -> Optional[str]:
         return None
 
 
-_MCP_CONFIG_PATH = _mcp_config_path()
+_MCP_SERVERS = _load_mcp_servers()
+_MCP_CONFIG_PATH = _mcp_config_path(_MCP_SERVERS)
+
+
+def _default_allowed_tools() -> str:
+    """Base tools plus one entry per configured MCP server."""
+    tools = [_BASE_ALLOWED_TOOLS]
+    tools += [f"mcp__{name}" for name in sorted(_MCP_SERVERS)]
+    if os.getenv("HERMES_CLAUDE_CLI_MCP_CONFIG"):
+        # Servers come from a file this module did not write; allow them all.
+        tools.append("mcp")
+    return ",".join(t for t in tools if t)
+
+
+_ALLOWED_TOOLS = os.getenv("HERMES_CLAUDE_CLI_ALLOWED_TOOLS", _default_allowed_tools())
 
 # The CLI inherits the gateway's cwd otherwise, which is not the agent's
 # working directory and is not on persistent storage.
