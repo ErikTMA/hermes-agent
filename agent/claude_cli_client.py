@@ -129,6 +129,23 @@ def _mcp_config_for(servers: Dict[str, dict]) -> Optional[str]:
         return None
 
 
+def _plan_for(request: str, cached: Optional[List[str]]) -> Tuple[Dict[str, dict], List[str], Optional[dict], Optional[dict]]:
+    """Capabilities plus the execution plan (model, effort, ultracode)."""
+    from agent.capability_router import load_catalogue, select_plan, load_execution_policy
+
+    catalogue = load_catalogue()
+    if not catalogue:
+        return {}, [], None, None
+    caps, plan, record = select_plan(catalogue, request)
+    # Capability grants are cached per conversation; the plan is not, because
+    # difficulty varies turn to turn within one thread.
+    if cached is not None:
+        kept = {n: catalogue[n] for n in cached if n in catalogue}
+        if kept:
+            caps = kept
+    return ({n: c.server for n, c in caps.items()}, sorted(caps), plan, record)
+
+
 def _capabilities_for(request: str, cached: Optional[List[str]]) -> Tuple[Dict[str, dict], List[str], Optional[dict]]:
     """Pick this turn's capabilities.
 
@@ -421,7 +438,9 @@ class _Run:
 
     def __init__(self, *, model: str, system: str, prompt: str, resume: Optional[str],
                  servers: Optional[Dict[str, dict]] = None,
-                 granted: Optional[Sequence[str]] = None):
+                 granted: Optional[Sequence[str]] = None,
+                 plan: Optional[dict] = None):
+        self.plan = plan or {}
         self.servers = servers or {}
         self.granted = list(granted or [])
         self.model = model
@@ -442,14 +461,22 @@ class _Run:
             "--verbose",
             "--include-partial-messages",
         ]
-        args += ["--allowedTools", _allowed_tools_for(self.granted)]
+        allowed = _allowed_tools_for(self.granted)
+        if self.plan.get("ultracode"):
+            # Workflow is what makes ultracode more than a keyword.
+            allowed = f"{allowed},Workflow,Task"
+        args += ["--allowedTools", allowed]
+        effort = self.plan.get("effort")
+        if effort:
+            args += ["--effort", effort]
         mcp_config = _mcp_config_for(self.servers)
         if mcp_config:
             # --strict-mcp-config so only these servers are loaded, never a
             # stray user-level MCP config from the image or the volume.
             args += ["--mcp-config", mcp_config, "--strict-mcp-config"]
-        if self.model:
-            args += ["--model", self.model]
+        model = self.plan.get("model") or self.model
+        if model:
+            args += ["--model", model]
         if self._resume:
             args += ["--resume", self._resume]
         if self._system:
@@ -612,15 +639,18 @@ class _Messages:
             prompt = _render_conversation(messages) or _last_user_text(messages)
 
         # Route on the newest user turn — that is what states the intent.
-        servers, granted, record = _capabilities_for(
-            _last_user_text(messages) or prompt, cached_grant
-        )
+        request = _last_user_text(messages) or prompt
+        servers, granted, plan, record = _plan_for(request, cached_grant)
         if record:
-            logger.info("Capability grant: %s", record)
+            logger.info("Turn plan: %s", record)
+
+        if plan and plan.get("ultracode"):
+            # ultracode is keyword-triggered in the CLI, not a flag.
+            prompt = f"ultracode\n\n{prompt}"
 
         run = _Run(
             model=model, system=system_text, prompt=prompt, resume=resume,
-            servers=servers, granted=granted,
+            servers=servers, granted=granted, plan=plan,
         )
         run._hermes_key_basis = (system_text, messages)  # type: ignore[attr-defined]
         return run
