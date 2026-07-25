@@ -33,8 +33,8 @@ Each turn would otherwise be a brand-new CLI session, re-sending the whole
 history and throwing away prompt caching. Instead the conversation *prefix*
 (everything before the newest user turn) is hashed and mapped to the CLI
 session id it produced; the next turn resumes that session with ``--resume``
-and sends only the new user message. The map is persisted, so continuity
-survives a gateway restart.
+and sends only the new user message. The map is persisted on the data volume
+(not in ``~/.hermes``, which is image-local), so continuity survives a restart.
 
 A cache miss is harmless — it just starts a fresh session with the full
 history rendered into the prompt.
@@ -254,6 +254,23 @@ class _Event:
 # Conversation -> CLI session mapping
 # ---------------------------------------------------------------------------
 
+def _state_dir() -> str:
+    """Where this module keeps state that must outlive the container.
+
+    ``~/.hermes`` is baked into the image: only specific subdirectories are
+    symlinked onto the data volume, so a file written directly there is lost on
+    every restart — taking conversation continuity and capability grants with
+    it. Prefer the data volume when it is mounted.
+    """
+    override = os.getenv("HERMES_CLI_STATE_DIR")
+    if override:
+        return override
+    for candidate in ("/data/hermes",):
+        if os.path.isdir(candidate) and os.access(candidate, os.W_OK):
+            return candidate
+    return _hermes_home()
+
+
 def _hermes_home() -> str:
     try:
         from utils import get_hermes_home  # type: ignore
@@ -266,7 +283,7 @@ class SessionMap:
     """Persistent conversation-prefix -> CLI session id map."""
 
     def __init__(self, path: Optional[str] = None):
-        self._path = path or os.path.join(_hermes_home(), "claude_cli_sessions.json")
+        self._path = path or os.path.join(_state_dir(), "claude_cli_sessions.json")
         self._lock = threading.Lock()
 
     def _load(self) -> Dict[str, dict]:
