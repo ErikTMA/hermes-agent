@@ -66,7 +66,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -107,56 +107,8 @@ _BASE_ALLOWED_TOOLS = "Read,Write,Edit,Glob,Grep,Bash(hermes memory:*)"
 _WORKDIR = os.getenv("HERMES_CLAUDE_CLI_CWD", "/home/hermes/workspace")
 
 
-def _load_mcp_servers() -> Dict[str, dict]:
-    """Read MCP servers from Hermes' own config.yaml.
-
-    Adding an MCP server is a config change, not a code change: whatever is
-    declared under ``mcp_servers:`` is offered to the CLI, so a new server can
-    be rolled out by editing the ConfigMap and restarting.
-
-    Servers whose command is not on PATH are skipped rather than failing the
-    turn — a misconfigured server should not take the agent offline.
-    """
-    override = os.getenv("HERMES_CLAUDE_CLI_MCP_CONFIG")
-    if override:
-        return {}
-
-    config_path = os.path.join(_hermes_home(), "config.yaml")
-    try:
-        import yaml
-        with open(config_path, encoding="utf-8") as fh:
-            cfg = yaml.safe_load(fh) or {}
-    except FileNotFoundError:
-        return {}
-    except Exception as exc:
-        logger.warning("Could not read %s for MCP servers (%s)", config_path, exc)
-        return {}
-
-    declared = cfg.get("mcp_servers")
-    if not isinstance(declared, dict):
-        return {}
-
-    servers: Dict[str, dict] = {}
-    for name, spec in declared.items():
-        if not isinstance(spec, dict):
-            continue
-        command = spec.get("command")
-        if not command:
-            continue
-        resolved = shutil.which(command)
-        if not resolved:
-            logger.warning("MCP server %r skipped: %r not on PATH", name, command)
-            continue
-        entry = {"command": resolved, "args": list(spec.get("args") or [])}
-        env = spec.get("env")
-        if isinstance(env, dict) and env:
-            entry["env"] = {str(k): str(v) for k, v in env.items()}
-        servers[name] = entry
-    return servers
-
-
-def _mcp_config_path(servers: Dict[str, dict]) -> Optional[str]:
-    """Materialise an MCP config for this process, or None if unusable."""
+def _mcp_config_for(servers: Dict[str, dict]) -> Optional[str]:
+    """Materialise an MCP config for one turn, or None if there is nothing to wire."""
     override = os.getenv("HERMES_CLAUDE_CLI_MCP_CONFIG")
     if override:
         return override if os.path.exists(override) else None
@@ -173,36 +125,36 @@ def _mcp_config_path(servers: Dict[str, dict]) -> Optional[str]:
         return None
 
 
-# Resolved on first use, not at import: _load_mcp_servers() depends on helpers
-# defined further down, and config.yaml is written by the entrypoint, which may
-# not have finished when this module is first imported.
-_MCP_STATE: Optional[tuple] = None
-_MCP_LOCK = threading.Lock()
+def _capabilities_for(request: str, cached: Optional[List[str]]) -> Tuple[Dict[str, dict], List[str], Optional[dict]]:
+    """Pick this turn's capabilities.
+
+    Returns (servers, granted_names, decision_record). ``cached`` is the grant
+    from earlier in the same conversation: capability needs rarely change
+    mid-thread, and re-running the router on every "ok, thanks" would add its
+    latency to turns that need nothing.
+    """
+    from agent.capability_router import load_catalogue, select_capabilities
+
+    catalogue = load_catalogue()
+    if not catalogue:
+        return {}, [], None
+
+    if cached is not None:
+        granted = {name: catalogue[name] for name in cached if name in catalogue}
+        if granted:
+            return ({n: c.server for n, c in granted.items()}, sorted(granted), None)
+
+    caps, record = select_capabilities(catalogue, request)
+    return ({n: c.server for n, c in caps.items()}, sorted(caps), record)
 
 
-def _mcp_state() -> tuple:
-    """Return (servers, config_path, allowed_tools), computing once."""
-    global _MCP_STATE
-    if _MCP_STATE is None:
-        with _MCP_LOCK:
-            if _MCP_STATE is None:
-                servers = _load_mcp_servers()
-                path = _mcp_config_path(servers)
-                tools = [_BASE_ALLOWED_TOOLS]
-                tools += [f"mcp__{name}" for name in sorted(servers)]
-                if os.getenv("HERMES_CLAUDE_CLI_MCP_CONFIG"):
-                    # Servers come from a file this module did not write.
-                    tools.append("mcp")
-                allowed = os.getenv(
-                    "HERMES_CLAUDE_CLI_ALLOWED_TOOLS",
-                    ",".join(t for t in tools if t),
-                )
-                if servers:
-                    logger.info(
-                        "Claude CLI MCP servers: %s", ", ".join(sorted(servers))
-                    )
-                _MCP_STATE = (servers, path, allowed)
-    return _MCP_STATE
+def _allowed_tools_for(granted: Sequence[str]) -> str:
+    """Base tools plus one allowlist entry per granted capability."""
+    override = os.getenv("HERMES_CLAUDE_CLI_ALLOWED_TOOLS")
+    if override:
+        return override
+    tools = [_BASE_ALLOWED_TOOLS] + [f"mcp__{name}" for name in sorted(granted)]
+    return ",".join(t for t in tools if t)
 
 # The CLI inherits the gateway's cwd otherwise, which is not the agent's
 # working directory and is not on persistent storage.
@@ -336,17 +288,20 @@ class SessionMap:
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("Could not persist CLI session map (%s)", exc)
 
-    def get(self, key: str) -> Optional[str]:
+    def get(self, key: str) -> Optional[dict]:
         with self._lock:
-            entry = self._load().get(key)
-        return entry.get("session_id") if entry else None
+            return self._load().get(key)
 
-    def put(self, key: str, session_id: str) -> None:
+    def put(self, key: str, session_id: str, grant: Optional[Sequence[str]] = None) -> None:
         if not key or not session_id:
             return
         with self._lock:
             data = self._load()
-            data[key] = {"session_id": session_id, "updated_at": time.time()}
+            data[key] = {
+                "session_id": session_id,
+                "grant": list(grant or []),
+                "updated_at": time.time(),
+            }
             self._save(data)
 
 
@@ -443,7 +398,11 @@ def _claude_binary() -> str:
 class _Run:
     """One CLI invocation, exposing its stream-json lines as parsed dicts."""
 
-    def __init__(self, *, model: str, system: str, prompt: str, resume: Optional[str]):
+    def __init__(self, *, model: str, system: str, prompt: str, resume: Optional[str],
+                 servers: Optional[Dict[str, dict]] = None,
+                 granted: Optional[Sequence[str]] = None):
+        self.servers = servers or {}
+        self.granted = list(granted or [])
         self.model = model
         self.session_id: Optional[str] = resume
         self.final_message: Optional[Message] = None
@@ -462,8 +421,8 @@ class _Run:
             "--verbose",
             "--include-partial-messages",
         ]
-        _servers, mcp_config, allowed_tools = _mcp_state()
-        args += ["--allowedTools", allowed_tools]
+        args += ["--allowedTools", _allowed_tools_for(self.granted)]
+        mcp_config = _mcp_config_for(self.servers)
         if mcp_config:
             # --strict-mcp-config so only these servers are loaded, never a
             # stray user-level MCP config from the image or the volume.
@@ -620,7 +579,9 @@ class _Messages:
         system_text = _system_text(system)
         prefix = messages[:-1] if messages else []
         key = _conversation_key(system_text, prefix)
-        resume = self._sessions.get(key)
+        entry = self._sessions.get(key)
+        resume = entry.get("session_id") if entry else None
+        cached_grant = entry.get("grant") if entry else None
 
         if resume:
             prompt = _last_user_text(messages)
@@ -629,7 +590,17 @@ class _Messages:
         else:
             prompt = _render_conversation(messages) or _last_user_text(messages)
 
-        run = _Run(model=model, system=system_text, prompt=prompt, resume=resume)
+        # Route on the newest user turn — that is what states the intent.
+        servers, granted, record = _capabilities_for(
+            _last_user_text(messages) or prompt, cached_grant
+        )
+        if record:
+            logger.info("Capability grant: %s", record)
+
+        run = _Run(
+            model=model, system=system_text, prompt=prompt, resume=resume,
+            servers=servers, granted=granted,
+        )
         run._hermes_key_basis = (system_text, messages)  # type: ignore[attr-defined]
         return run
 
@@ -647,7 +618,11 @@ class _Messages:
                 if isinstance(b, TextBlock)
             ],
         }
-        self._sessions.put(_conversation_key(system_text, list(messages) + [reply]), run.session_id)
+        self._sessions.put(
+            _conversation_key(system_text, list(messages) + [reply]),
+            run.session_id,
+            run.granted,
+        )
 
     def stream(self, *, model: str, messages: list, system: Any = None, **kwargs) -> _StreamManager:
         run = self._prepare(model=model, messages=messages, system=system)
