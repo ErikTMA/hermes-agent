@@ -39,12 +39,13 @@ survives a gateway restart.
 A cache miss is harmless — it just starts a fresh session with the full
 history rendered into the prompt.
 
-Known limitation
-----------------
-Hermes' own tools are not exposed. The CLI is invoked with ``--allowedTools ""``
-so it cannot run its own tools inside the pod outside Hermes' approval policy,
-and it therefore never emits ``tool_use`` blocks. Text and thinking work; tool
-calling through this path does not.
+Tools
+-----
+Hermes' agent loop cannot drive tools through this path — the CLI returns a
+finished turn rather than raw ``tool_use`` blocks. The CLI is therefore given a
+narrow allowlist of its own tools (see ``_DEFAULT_ALLOWED_TOOLS``) so the agent
+can at least read and write in its working directory and record memories.
+Override with ``HERMES_CLAUDE_CLI_ALLOWED_TOOLS``.
 """
 
 from __future__ import annotations
@@ -68,6 +69,25 @@ _CLI_TIMEOUT_SECONDS = int(os.getenv("HERMES_CLAUDE_CLI_TIMEOUT", "900"))
 
 # Sessions unused for this long are dropped from the map.
 _SESSION_TTL_SECONDS = int(os.getenv("HERMES_CLAUDE_CLI_SESSION_TTL", str(30 * 24 * 3600)))
+
+# Tools the CLI may run on its own.
+#
+# Hermes' agent loop cannot drive tools through this path: the CLI returns a
+# finished turn, never raw tool_use blocks for Hermes to execute. With no tools
+# at all the agent can only talk — it cannot take a note, maintain its own
+# CLAUDE.md, or record a memory, and it tends to misreport that as a sandbox
+# permission error.
+#
+# The default is deliberately narrow: read/write within its working directory,
+# plus the one shell command it needs to persist memory. It is NOT general
+# shell access — this pod holds cluster RBAC, an SSH key to the kali workspace,
+# and Infisical credentials. Widen it consciously, not by accident.
+_DEFAULT_ALLOWED_TOOLS = "Read,Write,Edit,Glob,Grep,Bash(hermes memory:*)"
+_ALLOWED_TOOLS = os.getenv("HERMES_CLAUDE_CLI_ALLOWED_TOOLS", _DEFAULT_ALLOWED_TOOLS)
+
+# The CLI inherits the gateway's cwd otherwise, which is not the agent's
+# working directory and is not on persistent storage.
+_WORKDIR = os.getenv("HERMES_CLAUDE_CLI_CWD", "/home/hermes/workspace")
 
 
 # ---------------------------------------------------------------------------
@@ -322,9 +342,7 @@ class _Run:
             "--output-format", "stream-json",
             "--verbose",
             "--include-partial-messages",
-            # Hermes owns tool execution and its approval policy. Letting the
-            # CLI run its own tools inside the pod would route around both.
-            "--allowedTools", "",
+            "--allowedTools", _ALLOWED_TOOLS,
         ]
         if self.model:
             args += ["--model", self.model]
@@ -340,12 +358,14 @@ class _Run:
             "claude CLI: model=%s resume=%s prompt_chars=%d",
             self.model, self._resume or "-", len(self._prompt),
         )
+        cwd = _WORKDIR if os.path.isdir(_WORKDIR) else None
         self._proc = subprocess.Popen(
             args + ["--", self._prompt],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            cwd=cwd,
         )
 
     def lines(self) -> Iterator[dict]:
