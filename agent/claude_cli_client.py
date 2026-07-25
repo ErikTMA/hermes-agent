@@ -173,21 +173,36 @@ def _mcp_config_path(servers: Dict[str, dict]) -> Optional[str]:
         return None
 
 
-_MCP_SERVERS = _load_mcp_servers()
-_MCP_CONFIG_PATH = _mcp_config_path(_MCP_SERVERS)
+# Resolved on first use, not at import: _load_mcp_servers() depends on helpers
+# defined further down, and config.yaml is written by the entrypoint, which may
+# not have finished when this module is first imported.
+_MCP_STATE: Optional[tuple] = None
+_MCP_LOCK = threading.Lock()
 
 
-def _default_allowed_tools() -> str:
-    """Base tools plus one entry per configured MCP server."""
-    tools = [_BASE_ALLOWED_TOOLS]
-    tools += [f"mcp__{name}" for name in sorted(_MCP_SERVERS)]
-    if os.getenv("HERMES_CLAUDE_CLI_MCP_CONFIG"):
-        # Servers come from a file this module did not write; allow them all.
-        tools.append("mcp")
-    return ",".join(t for t in tools if t)
-
-
-_ALLOWED_TOOLS = os.getenv("HERMES_CLAUDE_CLI_ALLOWED_TOOLS", _default_allowed_tools())
+def _mcp_state() -> tuple:
+    """Return (servers, config_path, allowed_tools), computing once."""
+    global _MCP_STATE
+    if _MCP_STATE is None:
+        with _MCP_LOCK:
+            if _MCP_STATE is None:
+                servers = _load_mcp_servers()
+                path = _mcp_config_path(servers)
+                tools = [_BASE_ALLOWED_TOOLS]
+                tools += [f"mcp__{name}" for name in sorted(servers)]
+                if os.getenv("HERMES_CLAUDE_CLI_MCP_CONFIG"):
+                    # Servers come from a file this module did not write.
+                    tools.append("mcp")
+                allowed = os.getenv(
+                    "HERMES_CLAUDE_CLI_ALLOWED_TOOLS",
+                    ",".join(t for t in tools if t),
+                )
+                if servers:
+                    logger.info(
+                        "Claude CLI MCP servers: %s", ", ".join(sorted(servers))
+                    )
+                _MCP_STATE = (servers, path, allowed)
+    return _MCP_STATE
 
 # The CLI inherits the gateway's cwd otherwise, which is not the agent's
 # working directory and is not on persistent storage.
@@ -446,12 +461,13 @@ class _Run:
             "--output-format", "stream-json",
             "--verbose",
             "--include-partial-messages",
-            "--allowedTools", _ALLOWED_TOOLS,
         ]
-        if _MCP_CONFIG_PATH:
+        _servers, mcp_config, allowed_tools = _mcp_state()
+        args += ["--allowedTools", allowed_tools]
+        if mcp_config:
             # --strict-mcp-config so only these servers are loaded, never a
             # stray user-level MCP config from the image or the volume.
-            args += ["--mcp-config", _MCP_CONFIG_PATH, "--strict-mcp-config"]
+            args += ["--mcp-config", mcp_config, "--strict-mcp-config"]
         if self.model:
             args += ["--model", self.model]
         if self._resume:
