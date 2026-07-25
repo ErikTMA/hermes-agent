@@ -91,16 +91,20 @@ _SESSION_TTL_SECONDS = int(os.getenv("HERMES_CLAUDE_CLI_SESSION_TTL", str(30 * 2
 # Tools the CLI may run on its own, before MCP servers are added.
 #
 # Hermes' agent loop cannot drive tools through this path: the CLI returns a
-# finished turn, never raw tool_use blocks for Hermes to execute. With no tools
-# at all the agent can only talk — it cannot take a note, maintain its own
-# CLAUDE.md, or record a memory, and it tends to misreport that as a sandbox
-# permission error.
+# finished turn, never raw tool_use blocks for Hermes to execute. Anything the
+# agent cannot do here it reports as being "blocked" or "denied permission",
+# which reads like an environment fault and is not — it is simply an absent
+# tool.
 #
-# Deliberately narrow: read/write within its working directory, plus the one
-# shell command it needs to persist memory. NOT general shell access — this pod
-# carries cluster RBAC, an SSH key to the kali workspace, and Infisical
-# credentials. Widen consciously, not by accident.
-_BASE_ALLOWED_TOOLS = "Read,Write,Edit,Glob,Grep,Bash(hermes memory:*)"
+# Bash is unrestricted by owner decision. Be clear about what that means: the
+# pod runs a privileged dind sidecar with DOCKER_HOST on loopback, so shell
+# here reaches the node, not just the container. It also holds cluster RBAC, an
+# SSH key to the kali workspace, and Infisical credentials for every project.
+# Narrow it with HERMES_CLAUDE_CLI_ALLOWED_TOOLS if that trade stops being
+# worth it.
+_BASE_ALLOWED_TOOLS = os.getenv(
+    "HERMES_CLAUDE_CLI_BASE_TOOLS", "Read,Write,Edit,Glob,Grep,Bash"
+)
 
 # The CLI inherits the gateway's cwd otherwise, which is not the agent's
 # working directory and is not on persistent storage.
