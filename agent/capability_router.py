@@ -51,7 +51,9 @@ logger = logging.getLogger(__name__)
 # context it saves, so everything routable is granted directly.
 _ROUTE_THRESHOLD = int(os.getenv("HERMES_CAPABILITY_ROUTE_THRESHOLD", "6"))
 
-_ROUTER_MODEL = os.getenv("HERMES_CAPABILITY_ROUTER_MODEL", "claude-haiku-4-5")
+# Alias rather than a pinned id, so the router follows the current fast model
+# instead of freezing on one generation.
+_ROUTER_MODEL = os.getenv("HERMES_CAPABILITY_ROUTER_MODEL", "haiku")
 _ROUTER_TIMEOUT = int(os.getenv("HERMES_CAPABILITY_ROUTER_TIMEOUT", "45"))
 
 _TIER_ALWAYS = "always"
