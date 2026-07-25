@@ -834,9 +834,21 @@ def build_anthropic_client(
         if common_betas:
             kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
     elif _is_oauth_token(api_key):
-        # OAuth access token / setup-token → Bearer auth + Claude Code identity.
-        # Anthropic routes OAuth requests based on user-agent and headers;
-        # without Claude Code's fingerprint, requests get intermittent 500s.
+        # Subscription (OAuth) auth is accepted from Claude Code itself. A
+        # direct SDK call with the same token is refused with a 400
+        # "You're out of extra usage" — the org-level overage rejection, not an
+        # exhausted balance. Route through the real first-party CLI, which is
+        # the supported way to spend a subscription from an automated context.
+        if os.getenv("HERMES_DISABLE_CLAUDE_CLI", "").strip().lower() not in ("1", "true", "yes"):
+            try:
+                from agent.claude_cli_client import build_claude_cli_client
+                logger.info("OAuth token detected — routing through the Claude Code CLI")
+                return build_claude_cli_client()
+            except (ImportError, FileNotFoundError) as e:
+                logger.warning(
+                    "Claude Code CLI unavailable (%s); falling back to the direct "
+                    "OAuth path, which an org with overage disabled will reject", e,
+                )
         all_betas = common_betas + _OAUTH_ONLY_BETAS
         kwargs["auth_token"] = api_key
         kwargs["default_headers"] = {
