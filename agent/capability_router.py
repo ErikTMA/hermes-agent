@@ -270,8 +270,15 @@ def _plan_from(tier: str, effort: Optional[str], ultracode: bool, policy: dict,
     if floor_tier and _TIER_ORDER.index(tier) < _TIER_ORDER.index(floor_tier):
         tier = floor_tier
     spec = policy["tiers"].get(tier) or _DEFAULT_EXECUTION["tiers"]["deep"]
-    effort = _clamp(effort or spec.get("effort", "high"), _EFFORT_ORDER,
-                    policy.get("max_effort", "xhigh"), spec.get("effort", "high"))
+    tier_effort = spec.get("effort", "high")
+    effort = _clamp(effort or tier_effort, _EFFORT_ORDER,
+                    policy.get("max_effort", "xhigh"), tier_effort)
+    # The tier's effort is a floor, not merely a default. Without this a turn
+    # promoted to `standard` still ran at whatever effort the router named —
+    # typically `low` — so the promotion bought the better model and then
+    # under-ran it.
+    if _EFFORT_ORDER.index(effort) < _EFFORT_ORDER.index(tier_effort):
+        effort = tier_effort
     uc = policy.get("ultracode", {})
     return {
         "tier": tier,
