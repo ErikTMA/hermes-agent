@@ -53,13 +53,31 @@ _MODEL = os.getenv("HERMES_MEMORY_WRITER_MODEL", "haiku")
 _TIMEOUT = int(os.getenv("HERMES_MEMORY_WRITER_TIMEOUT", "60"))
 _ENABLED = os.getenv("HERMES_MEMORY_WRITER", "1").strip().lower() not in ("0", "false", "no")
 
-# Matches the defaults in config.yaml's `memory:` block. The store is bounded on
-# purpose — it is injected into every system prompt, so unbounded growth is a
-# growing tax on every single turn.
-_LIMITS = {
-    "memory": int(os.getenv("HERMES_MEMORY_CHAR_LIMIT", "2200")),
-    "user": int(os.getenv("HERMES_USER_CHAR_LIMIT", "1375")),
-}
+
+def _limits() -> dict:
+    """Character ceilings, read from config.yaml so there is one source of truth.
+
+    These previously duplicated config.yaml's defaults as literals here, which
+    meant raising the limit in config changed Hermes' own memory tool and left
+    this writer trimming to the old value — the two would silently disagree.
+    """
+    limits = {"memory": 2200, "user": 1375}
+    try:
+        import yaml
+        cfg_path = os.path.join(_hermes_home_dir(), "config.yaml")
+        with open(cfg_path, encoding="utf-8") as fh:
+            mem = (yaml.safe_load(fh) or {}).get("memory") or {}
+        if isinstance(mem.get("memory_char_limit"), int):
+            limits["memory"] = mem["memory_char_limit"]
+        if isinstance(mem.get("user_char_limit"), int):
+            limits["user"] = mem["user_char_limit"]
+    except Exception:
+        pass
+    limits["memory"] = int(os.getenv("HERMES_MEMORY_CHAR_LIMIT", limits["memory"]))
+    limits["user"] = int(os.getenv("HERMES_USER_CHAR_LIMIT", limits["user"]))
+    return limits
+
+
 _FILES = {"memory": "MEMORY.md", "user": "USER.md"}
 
 _MAX_NEW_PER_TURN = 3
@@ -74,12 +92,16 @@ _IMPERATIVE = re.compile(
 _lock = threading.Lock()
 
 
-def _memories_dir() -> Path:
+def _hermes_home_dir() -> str:
     try:
         from utils import get_hermes_home  # type: ignore
-        return Path(get_hermes_home()) / "memories"
+        return str(get_hermes_home())
     except Exception:
-        return Path(os.path.expanduser(os.getenv("HERMES_HOME", "~/.hermes"))) / "memories"
+        return os.path.expanduser(os.getenv("HERMES_HOME", "~/.hermes"))
+
+
+def _memories_dir() -> Path:
+    return Path(_hermes_home_dir()) / "memories"
 
 
 def _read_entries(path: Path) -> List[str]:
@@ -189,7 +211,7 @@ def _apply(target: str, candidates: List[str]) -> int:
         added += 1
     if not added:
         return 0
-    existing = _fit(existing, _LIMITS[target])
+    existing = _fit(existing, _limits()[target])
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
