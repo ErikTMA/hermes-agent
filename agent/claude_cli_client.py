@@ -382,12 +382,30 @@ def _system_text(system: Any) -> str:
 def _conversation_key(system: str, messages: list) -> str:
     """Stable fingerprint of a conversation prefix.
 
-    Two different chats only collide if their entire history *and* system
-    prompt are byte-identical, in which case resuming the same CLI session
-    leaks nothing that was not already identical.
+    The system prompt is deliberately NOT part of this key, despite being the
+    obvious thing to include. It is not stable across turns: it carries
+    MEMORY.md, USER.md and the injected Honcho representation, all of which are
+    rewritten as a side effect of ordinary conversation — and of the mail-triage
+    cron, which runs an agent turn every five minutes and mutates memory on a
+    schedule the chat knows nothing about.
+
+    When the system prompt was in the key, a memory write between two turns
+    changed the key, `get` missed, `--resume` was dropped, and the CLI started a
+    fresh session. From the user's side the agent forgot itself mid-conversation
+    for no visible reason. The live map held 131 entries for a single Telegram
+    thread: one orphaned session per turn.
+
+    Collision safety is unchanged in practice. Two chats still only share a
+    session if their entire history is byte-identical, and the system prompt
+    here is global to the agent rather than per-chat — so it could never have
+    separated two otherwise-identical conversations anyway.
+
+    `system` stays in the signature so call sites keep documenting what they
+    considered; it is intentionally unused.
     """
+    del system  # see above — volatile, must not affect session identity
     payload = json.dumps(
-        {"system": system, "messages": messages},
+        {"messages": messages},
         sort_keys=True,
         default=str,
         ensure_ascii=False,
