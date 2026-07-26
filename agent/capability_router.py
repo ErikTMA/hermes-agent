@@ -269,6 +269,18 @@ def _plan_from(tier: str, effort: Optional[str], ultracode: bool, policy: dict,
                   policy.get("default_tier", "deep"))
     if floor_tier and _TIER_ORDER.index(tier) < _TIER_ORDER.index(floor_tier):
         tier = floor_tier
+    # Policy floor, applied after the per-turn floor and after the router's
+    # proposal. The router is a small model judging difficulty from one message,
+    # with no way to know what the turn will actually require and no feedback
+    # when it guesses low. Its mistakes are invisible and land as confident
+    # wrong answers from a model too small for the question — which the next
+    # turn, routed higher, then contradicts.
+    #
+    # `min_tier` is how an operator says "never cheaper than this, whatever the
+    # router thinks". Unset, behaviour is unchanged.
+    min_tier = policy.get("min_tier")
+    if min_tier in _TIER_ORDER and _TIER_ORDER.index(tier) < _TIER_ORDER.index(min_tier):
+        tier = min_tier
     spec = policy["tiers"].get(tier) or _DEFAULT_EXECUTION["tiers"]["deep"]
     tier_effort = spec.get("effort", "high")
     effort = _clamp(effort or tier_effort, _EFFORT_ORDER,
@@ -444,11 +456,31 @@ def select_plan(
     chosen = {name for name in selection if name in routable}
     rejected = [name for name in selection if name not in routable]
     granted = {**always}
-    granted.update({name: routable[name] for name in chosen})
+
+    # Withholding a capability is only worth doing when there are enough of them
+    # that their descriptions crowd the context. `select_capabilities` has always
+    # had this guard; `select_plan` — the function actually on the live path —
+    # never did, so with two routable capabilities a haiku call was deciding, per
+    # turn, whether LANA could see its own mailbox. Across 150 logged turns it
+    # withheld everything on 101 of them.
+    #
+    # The user-visible result is not a missing tool, it is a false statement:
+    # asked "can you do X" on a turn where X was withheld, the agent truthfully
+    # says no, then does X two turns later when the router happened to grant it,
+    # and has to describe its own earlier answer as wrong. That reads as lying.
+    #
+    # Below the threshold the router still sizes the turn (model, effort,
+    # ultracode) — that part is worth the call. It just no longer gets to decide
+    # what the agent is capable of.
+    route_capabilities = len(routable) >= _ROUTE_THRESHOLD
+    if route_capabilities:
+        granted.update({name: routable[name] for name in chosen})
+    else:
+        granted.update(routable)
 
     # Needing a real capability means real work — never downgrade below
     # standard for those turns, whatever the router guessed.
-    floor = "standard" if chosen else None
+    floor = "standard" if (chosen or not route_capabilities) else None
     plan = _plan_from(decision.get("tier") or policy.get("default_tier", "deep"),
                       decision.get("effort"), decision.get("ultracode"), policy,
                       floor_tier=floor)
