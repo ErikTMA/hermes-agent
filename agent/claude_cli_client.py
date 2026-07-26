@@ -480,7 +480,19 @@ class _Run:
         if self._resume:
             args += ["--resume", self._resume]
         if self._system:
-            args += ["--system-prompt", self._system]
+            # NOT --system-prompt. Linux caps a single argv entry at
+            # MAX_ARG_STRLEN (128 KiB), and the system prompt carries MEMORY.md,
+            # USER.md and the skill descriptions — it crosses that on an ordinary
+            # long-running conversation. exec() then fails with
+            # `[Errno 7] Argument list too long`, which the retry loop treats as
+            # a transient provider fault and retries three times with the same
+            # oversized argv. The user sees "the model provider failed after
+            # retries" and every retry is guaranteed to fail identically.
+            fd, path = tempfile.mkstemp(prefix="hermes-sysprompt-", suffix=".md")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(self._system)
+            self._sys_file = path
+            args += ["--system-prompt-file", path]
         return args
 
     def start(self) -> None:
@@ -490,39 +502,73 @@ class _Run:
             self.model, self._resume or "-", len(self._prompt),
         )
         cwd = _WORKDIR if os.path.isdir(_WORKDIR) else None
+        # The prompt goes on stdin for the same reason, and it is the half that
+        # grows without bound: it carries the conversation. Nothing may be
+        # passed positionally.
         self._proc = subprocess.Popen(
-            args + ["--", self._prompt],
+            args,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
             cwd=cwd,
         )
+        # Written from a thread: a pipe holds 64 KiB and the prompt is routinely
+        # larger, so a synchronous write would block until the child drains it.
+        # The child does drain it before emitting output today, but that is its
+        # behaviour rather than a guarantee, and the deadlock it would cause is
+        # a silent hang rather than an error.
+        def _feed() -> None:
+            try:
+                assert self._proc is not None and self._proc.stdin is not None
+                self._proc.stdin.write(self._prompt)
+                self._proc.stdin.close()
+            except (BrokenPipeError, ValueError, AssertionError):
+                # Child exited early; its stderr is the useful diagnostic.
+                pass
+
+        threading.Thread(target=_feed, name="claude-cli-stdin", daemon=True).start()
+
+    def _cleanup_sys_file(self) -> None:
+        if self._sys_file:
+            try:
+                os.unlink(self._sys_file)
+            except OSError:
+                pass
+            self._sys_file = None
 
     def lines(self) -> Iterator[dict]:
         """Yield parsed JSON lines, tracking session id and final message."""
         assert self._proc is not None and self._proc.stdout is not None
         deadline = time.time() + _CLI_TIMEOUT_SECONDS
-        for raw in self._proc.stdout:
-            if time.time() > deadline:
-                self._proc.kill()
-                raise TimeoutError(f"Claude CLI exceeded {_CLI_TIMEOUT_SECONDS}s")
-            raw = raw.strip()
-            if not raw:
-                continue
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            sid = data.get("session_id")
-            if sid:
-                self.session_id = sid
-            kind = data.get("type")
-            if kind == "assistant":
-                self._absorb_assistant(data.get("message") or {})
-            elif kind == "result" or "total_cost_usd" in data:
-                self._absorb_result(data)
-            yield data
+        try:
+            for raw in self._proc.stdout:
+                if time.time() > deadline:
+                    self._proc.kill()
+                    raise TimeoutError(f"Claude CLI exceeded {_CLI_TIMEOUT_SECONDS}s")
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                sid = data.get("session_id")
+                if sid:
+                    self.session_id = sid
+                kind = data.get("type")
+                if kind == "assistant":
+                    self._absorb_assistant(data.get("message") or {})
+                elif kind == "result" or "total_cost_usd" in data:
+                    self._absorb_result(data)
+                yield data
+        finally:
+            # Covers normal completion, the timeout kill, and an abandoned
+            # generator. The system prompt is not secret, but it is the user's
+            # memory — leaving copies in /tmp for every turn is both a slow leak
+            # and a disclosure nobody asked for.
+            self._cleanup_sys_file()
 
     def _absorb_assistant(self, message: dict) -> None:
         usage = message.get("usage") or {}
