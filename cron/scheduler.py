@@ -207,6 +207,25 @@ def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]
     return result
 
 
+def _cron_memory_read_enabled() -> bool:
+    """True when the memory provider is explicitly opt-in read-only for cron.
+
+    Cron must never WRITE to memory -- a cron job's "user" message is a job
+    spec, not the user talking, and ingesting it corrupts the user
+    representation. That block lives in the provider itself.
+
+    This gate is about CONSTRUCTION, not writes: agent_init.py skips building
+    the memory provider at all when skip_memory=True, so a provider-side read
+    path is unreachable unless this returns True. Fails closed on any error.
+    """
+    try:
+        from plugins.memory.honcho.client import HonchoClientConfig
+        cfg = HonchoClientConfig.from_global_config()
+        return bool(cfg.enabled and cfg.cron_read and (cfg.api_key or cfg.base_url))
+    except Exception:
+        return False
+
+
 def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     """Resolve the toolset list for a cron job.
 
@@ -3364,7 +3383,13 @@ def run_job(
             # Without a workdir, keep cwd context discovery disabled.
             skip_context_files=not bool(_job_workdir),
             load_soul_identity=True,
-            skip_memory=True,  # Cron system prompts would corrupt user representations
+            # Cron system prompts would corrupt user representations, so writes
+            # stay off unconditionally (the memory plugin blocks them itself via
+            # _cron_readonly). But skip_memory=True prevents the provider from
+            # ever being CONSTRUCTED (agent_init.py: `if not skip_memory:`), so
+            # with it hardcoded True the plugin's read path is dead code. Only
+            # lower this gate when the provider is explicitly opt-in read-only.
+            skip_memory=not _cron_memory_read_enabled(),
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
