@@ -294,6 +294,10 @@ class HonchoMemoryProvider(MemoryProvider):
 
         # Cron and flush contexts disable the plugin entirely.
         self._cron_skipped = False
+        # Cron read-only: plugin initialized for context injection, but every
+        # write path (sync_turn, memory actions, session-end flush, tools) is
+        # blocked. Enabled per-host via honcho.json cronRead.
+        self._cron_readonly = False
 
     @property
     def name(self) -> str:
@@ -346,10 +350,27 @@ class HonchoMemoryProvider(MemoryProvider):
             agent_context = kwargs.get("agent_context", "")
             platform = kwargs.get("platform", "cli")
             if agent_context in {"cron", "flush"} or platform == "cron":
-                logger.debug("Honcho skipped: cron/flush context (agent_context=%s, platform=%s)",
-                             agent_context, platform)
-                self._cron_skipped = True
-                return
+                # Read-only cron is opt-in and never applies to flush, which is
+                # itself a memory-write operation.
+                _read_ok = False
+                if agent_context != "flush":
+                    try:
+                        from plugins.memory.honcho.client import HonchoClientConfig
+                        _probe = HonchoClientConfig.from_global_config()
+                        _read_ok = bool(
+                            _probe.enabled
+                            and _probe.cron_read
+                            and (_probe.api_key or _probe.base_url)
+                        )
+                    except Exception:
+                        _read_ok = False
+                if not _read_ok:
+                    logger.debug("Honcho skipped: cron/flush context (agent_context=%s, platform=%s)",
+                                 agent_context, platform)
+                    self._cron_skipped = True
+                    return
+                self._cron_readonly = True
+                logger.debug("Honcho cron read-only: context injection on, writes blocked")
 
             from plugins.memory.honcho.client import HonchoClientConfig, get_honcho_client
             from plugins.memory.honcho.session import HonchoSessionManager
@@ -1331,7 +1352,7 @@ class HonchoMemoryProvider(MemoryProvider):
         Messages exceeding the Honcho API limit (default 25k chars) are
         split into multiple messages with continuation markers.
         """
-        if self._cron_skipped:
+        if self._cron_skipped or self._cron_readonly:
             return
         if self._recall_mode == "tools" and not self._session_ready():
             return
@@ -1377,7 +1398,7 @@ class HonchoMemoryProvider(MemoryProvider):
         """
         if action != "add" or target != "user" or not content:
             return
-        if self._cron_skipped:
+        if self._cron_skipped or self._cron_readonly:
             return
         if self._recall_mode == "tools" and not self._session_ready():
             return
@@ -1396,7 +1417,7 @@ class HonchoMemoryProvider(MemoryProvider):
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Flush all pending messages to Honcho on session end."""
-        if self._cron_skipped:
+        if self._cron_skipped or self._cron_readonly:
             return
         if not self._manager:
             return
@@ -1415,7 +1436,7 @@ class HonchoMemoryProvider(MemoryProvider):
 
         Context-only mode exposes no Honcho tools.
         """
-        if self._cron_skipped:
+        if self._cron_skipped or self._cron_readonly:
             return []
         if self._recall_mode == "context":
             return []
@@ -1423,7 +1444,7 @@ class HonchoMemoryProvider(MemoryProvider):
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         """Handle a Honcho tool call, with lazy session init for tools-only mode."""
-        if self._cron_skipped:
+        if self._cron_skipped or self._cron_readonly:
             return tool_error("Honcho is not active (cron context).")
 
         if not self._session_initialized:

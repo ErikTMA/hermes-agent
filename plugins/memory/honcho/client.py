@@ -427,6 +427,11 @@ class HonchoClientConfig:
     # Eager init in tools mode — when true, initializes session during
     # initialize() instead of deferring to first tool call
     init_on_session_start: bool = False
+    # Cron read-only memory: when true, cron-context agents get context
+    # injection (read) but never write to Honcho. Writes stay off because a
+    # cron job's "user" message is a job spec, not the user talking, and
+    # ingesting it corrupts the user representation.
+    cron_read: bool = False
     # Injection frequency: "every-turn" (default) or "first-turn" (inject only on turn 1)
     injection_frequency: str = "every-turn"
     # Minimum turns between peer.context() API calls (base layer refresh cadence)
@@ -677,6 +682,11 @@ class HonchoClientConfig:
             init_on_session_start=_resolve_bool(
                 host_block.get("initOnSessionStart"),
                 raw.get("initOnSessionStart"),
+                default=False,
+            ),
+            cron_read=_resolve_bool(
+                host_block.get("cronRead"),
+                raw.get("cronRead"),
                 default=False,
             ),
             # Host cadence settings override flat/global values.
